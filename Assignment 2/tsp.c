@@ -1,17 +1,47 @@
+/*
+*
+*		CS527 Parallel Computer Architecture
+*		Assignemnt 2	Parallel Programming
+*		Topic - MPI (Message Passing Interface)		
+*	Solution of Travelling Salesman in C using MPI 
+*         
+*		Group - 2
+*   Members -  Abhishek Kumar 180101003
+*			   Aniraj Kumar	  180101007
+*			   Munindra Naik  180101045
+*			   Ritik Mandloi 180101066
+*
+*	Approach - The idea is to have a bag of tasks, in which initially a single task is placed globally. Multiple processes take tasks from the bag and process them, often generating 
+*			   new tasks that will be corresponding to subproblems. The new  tasks are placed in the bag. The computation ends when there does not exist any tasks to perform. 
+*			   We will have two types of processes one will be the host and worker, there will be one host process which will assign tasks to the worker process and the worker will be performing tasks 
+*              and returning either a solution containing the hamiltonian path or further subproblems which need to be solved. The host 
+*              process will maintain a variable which will store the answer of the problem which will be updated whenever a worker process finds  a solution and 
+*              compares if a  better value is found or not. 
+*			
+*	
+*	Compilation and Execution 
+*   1) mpicc -w tsp.c -o tsp
+*	2) mpirun --np 'number of processes' ./tsp 'number of cities' 'filename'
+*                         or 
+*	   mpirun --np 'number of processes' ./tsp - after that enter number of cities and then a 2d matrix where (i,j) refers to distance b/w ith and jth city
+*												 if there is no path b/w ith and jth then enter '-1' and for (i,i) entry enter '0'
+*/
 #include <stdio.h>
 #include <stdlib.h>
-#include <mpi.h>
 #include <limits.h>
 #include <string.h>
+#include <time.h>
+#include <math.h>
+#include <ctype.h>
+#include <mpi.h>
 
+//defining a variable which signifies a significantly long path if there is no edge b/w 
+#define INF 2e9+7
+// defining tags which occurs in messages
 #define TASK_TAG 1
 #define AVAILABLE_TAG 2
 #define FINALIZE_TAG 3
-#ifdef ENABLE_DEBUG
-#define DEBUG(F,...) printf(F"\n",##__VA_ARGS__)
-#else
-#define DEBUG(F,...)
-#endif
+
 
 typedef struct {
     int longMin;
@@ -33,6 +63,7 @@ typedef struct {
 } List;
 
 
+//creating a data structure list which stores pool of tasks and available workers
 List *listNew()
 {
     List *newList = malloc(sizeof(List));
@@ -41,7 +72,8 @@ List *listNew()
     newList->itemsCount = 0;
 }
 
-void listEnqueue(List * list, void *data)
+// method to add item to list
+void enqueue(List * list, void *data)
 {
     ListItem *item;
     item = malloc(sizeof(ListItem));
@@ -57,10 +89,9 @@ void listEnqueue(List * list, void *data)
 	list->head = item;
     }
     list->itemsCount++;
-
-    DEBUG("listEnqueue: data=%p", data);
 }
 
+// helper method to remove item form list
 void *removeItem(List * list, ListItem * item)
 {
     void *data;
@@ -86,18 +117,17 @@ void *removeItem(List * list, ListItem * item)
     data = item->data;
     list->itemsCount--;
     free(item);
-    DEBUG("removeItem: list->head=%p, list->itemsCount=%d", list->head,
-	  list->itemsCount);
     return data;
 
 }
 
-
-void *listDequeue(List * list)
+// method to remove item from list
+void *dequeue(List * list)
 {
     return removeItem(list, list->head);
 }
 
+//function to create new task
 TSP_task *newTask(int m, int n)
 {
     TSP_task *task;
@@ -118,6 +148,7 @@ TSP_task *calc_task_pointer(void *base, int n, int idx)
     return base + (sizeof(TSP_task) + n * sizeof(int)) * idx;
 }
 
+//function to read the input if given filename
 int *readMatrix(char *fileName, int n)
 {
 
@@ -130,17 +161,7 @@ int *readMatrix(char *fileName, int n)
     return matrix;
 }
 
-void printMatrix(int *matrix, int n)
-{
-    int i, j;
-    for (i = 0; i < n; i++) {
-	for (j = 0; j < n; j++) {
-	    printf("%d ", matrix[n * i + j]);
-	}
-	printf("\n");
-    }
-}
-
+//function to print the route after finding the solution
 void printRoute(int *route, int routeLen)
 {
     int i;
@@ -150,28 +171,14 @@ void printRoute(int *route, int routeLen)
     printf("]\n");
 }
 
-void printTask(TSP_task * task)
-{
-    printf
-	("TASK:\n\tlongMin: %d\n\tpartialLong: %d\n\tvisitedCount: %d\n\tcityToVisit: %d\n\t[",
-	 task->longMin, task->partialLong, task->visitedCount,
-	 task->cityToVisit);
-    printRoute(task->visited, task->visitedCount);
-}
-
-MPI_Datatype constructWorkType(int n)
-{
-    MPI_Datatype workType;
-    MPI_Type_contiguous(n + 4, MPI_INT, &workType);
-    MPI_Type_commit(&workType);
-
-    return workType;
-}
-
+// defining the work that has to be done by host process
 void hostWork(int *matrix, int n)
 {
-    MPI_Datatype taskType = constructWorkType(n);
-    MPI_Status status;
+    MPI_Datatype taskType; 
+	MPI_Type_contiguous(n + 4, MPI_INT, &taskType);
+    MPI_Type_commit(&taskType);
+    
+	MPI_Status status;
     TSP_task *task, *tasks, *t;
     List *taskBag = listNew();
     List *availableWorkers = listNew();
@@ -189,20 +196,16 @@ void hostWork(int *matrix, int n)
 	    task->visitedCount = 1;
 	    task->visited[0] = 0;
 	    task->partialLong = 0;
-	    listEnqueue(taskBag, task);
+	    enqueue(taskBag, task);
     }
 
     do {
-	DEBUG("available Workers: %d, taskBag: %d", availableWorkers->itemsCount, taskBag->itemsCount);
-	DEBUG("[Master] Waiting for messages..");
 	MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-	DEBUG("[Master] New message from rank=%d and tag=%d", status.MPI_SOURCE, status.MPI_TAG);
 	if (status.MPI_TAG == TASK_TAG) {
 	    MPI_Get_count(&status, taskType, &elementsCount);
 	    tasks = newTask(elementsCount, n);
 	    MPI_Recv(tasks, elementsCount, taskType, status.MPI_SOURCE,
 		     status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-	    DEBUG("[Master] Message with %d tasks", elementsCount);
 	    for (i = 0; i < elementsCount; i++) {
 		task = calc_task_pointer(tasks, n, i);
 
@@ -215,14 +218,14 @@ void hostWork(int *matrix, int n)
 		} else {
 		    t = newTask(1, n);
 		    memcpy(t, task, sizeof(TSP_task) + sizeof(int) * n);
-		    listEnqueue(taskBag, t);
+		    enqueue(taskBag, t);
 		}
 	    }
 	    free(tasks);
 	    // Assinging tasks
 	    while (availableWorkers->itemsCount > 0 && taskBag->itemsCount > 0) {
-		    task = listDequeue(taskBag);
-		    rank = (int) listDequeue(availableWorkers);
+		    task = dequeue(taskBag);
+		    rank = (int) dequeue(availableWorkers);
 		    task->longMin = longMin;
 		    MPI_Send(task, 1, taskType, rank, TASK_TAG, MPI_COMM_WORLD);
 		    free(task);
@@ -231,19 +234,19 @@ void hostWork(int *matrix, int n)
 	    // AVAILABLE_TAG
 	    MPI_Recv(&rank, 1, MPI_INT, status.MPI_SOURCE, status.MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 	    if (taskBag->itemsCount > 0) {
-		    task = listDequeue(taskBag);
+		    task = dequeue(taskBag);
 		    task->longMin = longMin;
 		    MPI_Send(task, 1, taskType, rank, TASK_TAG, MPI_COMM_WORLD);
 		    free(task);
 	    } else {
-		    listEnqueue(availableWorkers, (void *) rank);
+		    enqueue(availableWorkers, (void *) rank);
 	    }
 	}
     }
     while (availableWorkers->itemsCount < 3 || taskBag->itemsCount > 0);
     
     // Sending message of completion
-    while ((rank = (int) listDequeue(availableWorkers)) != 0)
+    while ((rank = (int) dequeue(availableWorkers)) != 0)
 	MPI_Send(&rank, 1, MPI_INT, rank, FINALIZE_TAG, MPI_COMM_WORLD);
 
     // printing the best route
@@ -253,6 +256,7 @@ void hostWork(int *matrix, int n)
     printf("Cost of the route: %d\n", longMin);
 }
 
+//performing the allotment of tasks to host process
 void findCitiesToVisit(int *visited, int visitedCount, int *ret, int n)
 {
     int i, j;
@@ -260,8 +264,7 @@ void findCitiesToVisit(int *visited, int visitedCount, int *ret, int n)
 
     memset(sortedArr, 0, sizeof(sortedArr));
     for (i = 0; i < visitedCount; i++) {
-	DEBUG("find Cities To Visit: visited[i=%d]=%d", i, visited[i]);
-	sortedArr[visited[i]] = 1;
+		sortedArr[visited[i]] = 1;
     }
     for (i = 0, j = 0; i < n; i++) {
 	if (sortedArr[i] == 0)
@@ -269,10 +272,14 @@ void findCitiesToVisit(int *visited, int visitedCount, int *ret, int n)
     }
 }
 
+//performing the work given by host process
 void distributedWork(int *matrix, int n, int rank)
 {
-    MPI_Datatype taskType = constructWorkType(n);
-    TSP_task *task, *t, *tasks;
+    MPI_Datatype taskType; 
+	MPI_Type_contiguous(n + 4, MPI_INT, &taskType);
+    MPI_Type_commit(&taskType);
+    
+	TSP_task *task, *t, *tasks;
     MPI_Status status;
     int citiesToVisit;
     int cities[n];
@@ -286,9 +293,7 @@ void distributedWork(int *matrix, int n, int rank)
 	if (status.MPI_TAG == FINALIZE_TAG)
 	    break;
 
-	MPI_Recv(task, 1, taskType, 0, TASK_TAG, MPI_COMM_WORLD,
-		 MPI_STATUS_IGNORE);
-	DEBUG("Tasks recieved from rank=%d", rank);
+	MPI_Recv(task, 1, taskType, 0, TASK_TAG, MPI_COMM_WORLD,MPI_STATUS_IGNORE);
 	if (task->visitedCount >= n) {
 	    // visited all of the cities, going back to 0
 	    task->partialLong += matrix[task->visited[task->visitedCount - 1] * n];
@@ -304,7 +309,6 @@ void distributedWork(int *matrix, int n, int rank)
 		citiesToVisit = n - task->visitedCount;
 		if (citiesToVisit > 0) {
 		    tasks = newTask(citiesToVisit, n);
-		    DEBUG("task->visitedCount=%d", task->visitedCount);
 		    findCitiesToVisit(task->visited, task->visitedCount,cities, n);
 		    for (i = 0; i < citiesToVisit; i++) {
 				t = calc_task_pointer(tasks, n, i);
@@ -331,38 +335,56 @@ int main(int argc, char *argv[])
 
     MPI_Datatype matrixType;
 
-
+	//initializing the MPI execution
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     // refering process with rank 0 as our host process
     if (rank == 0) {
-	    n = atoi(argv[1]);
-	    matrix = readMatrix(argv[2], n);
+		if(argc == 3){
+	    	n = atoi(argv[1]);
+	    	matrix = readMatrix(argv[2], n);
+		}else{
+			scanf("%d",&n);
+			matrix = calloc(n*n,sizeof(int));
+			for(int i=0;i<n;i++){
+				for(int j=0;j<n;j++){
+					scanf("%d",&matrix[n*i+j]);
+					if(matrix[n*i+j] == -1) matrix[n*i+j] = INF;
+					printf("%d ",matrix[n*i+j]);
+				}
+				printf("\n");
+			} 
+		}
 	    MPI_Type_contiguous(n * n, MPI_INT, &matrixType);
 	    MPI_Type_commit(&matrixType);
 
-	    //Sending integer n from host
+	    //broadcasting the number of cities from host
 	    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-	    //Sending matrix from host
+	    //broadcasting the distance matrix from host
 	    MPI_Bcast(matrix, 1, matrixType, 0, MPI_COMM_WORLD);
-	    hostWork(matrix, n);
+
+	    //performing the allotment of tasks to host process
+		hostWork(matrix, n);
 
     } else {
-	//Reciving n from host process       
+		//Reciving the value of number of cities from host process       
 	    MPI_Bcast(&n, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
 	    MPI_Type_contiguous(n * n, MPI_INT, &matrixType);
 	    MPI_Type_commit(&matrixType);
 	    matrix = malloc(n * n * sizeof(int));
 
-	    //Reciving matrix
+	    //Reciving the distance matrix from host
 	    MPI_Bcast(matrix, 1, matrixType, 0, MPI_COMM_WORLD);
+
+		//performing the work given by host process
 	    distributedWork(matrix, n, rank);
     }
 
+	//shutting down the mpi execution
     MPI_Finalize();
     return 0;
 }
